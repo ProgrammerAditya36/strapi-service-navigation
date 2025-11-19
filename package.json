@@ -1,0 +1,41 @@
+{
+  "name": "strapi-service-navigation",
+  "displayName": "Strapi Service Navigation",
+  "description": "Enable Go to Definition for Strapi service method calls",
+  "version": "0.1.0",
+  "publisher": "aditya-amit-k",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:javascript"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Strapi Service Navigation",
+      "properties": {
+        "strapiServiceNavigation.srcPath": {
+          "type": "string",
+          "default": "src",
+          "description": "Path to the src directory containing Strapi API services (relative to workspace root)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "strapi",
+    "navigation",
+    "go-to-definition",
+    "service"
+  ],
+  "license": "MIT"
+}
+
