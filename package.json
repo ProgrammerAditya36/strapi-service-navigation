@@ -36,6 +36,10 @@
     "go-to-definition",
     "service"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ProgrammerAditya36/strapi-service-navigation.git"
+  },
   "license": "MIT"
 }
 
