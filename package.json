@@ -2,7 +2,7 @@
   "name": "strapi-service-navigation",
   "displayName": "Strapi Service Navigation",
   "description": "Enable Go to Definition for Strapi service method calls",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "aditya-amit-k",
   "engines": {
     "vscode": "^1.60.0"

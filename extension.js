@@ -31,12 +31,8 @@ class StrapiServiceDefinitionProvider {
    * @returns {Promise<vscode.Definition|vscode.LocationLink[]>}
    */
   provideDefinition(document, position, token) {
-    const line = document.lineAt(position.line);
-    const lineText = line.text;
-    const offset = document.offsetAt(position);
-
     // Check if cursor is on a service method call
-    const serviceCallMatch = this.findServiceCallAtPosition(lineText, position.character);
+    const serviceCallMatch = this.findServiceCallAtPosition(document, position);
     if (!serviceCallMatch) {
       return null;
     }
@@ -66,20 +62,33 @@ class StrapiServiceDefinitionProvider {
    * @param {number} character
    * @returns {{serviceName: string, methodName: string}|null}
    */
-  findServiceCallAtPosition(lineText, character) {
-    // Match pattern: strapi.service('api::...').methodName
-    // This regex matches the entire service call chain
+  findServiceCallAtPosition(document, position) {
+    const line = document.lineAt(position.line);
+    const lineText = line.text;
+
+    // Try inline service call on the same line
+    const inlineMatch = this.matchInlineServiceCall(lineText, position.character);
+    if (inlineMatch) {
+      return inlineMatch;
+    }
+
+    // Try chained service call via variable reference
+    return this.matchChainedServiceCall(document, position);
+  }
+
+  /**
+   * Match inline strapi service call on the same line
+   * @param {string} lineText
+   * @param {number} character
+   */
+  matchInlineServiceCall(lineText, character) {
     const serviceCallRegex = /strapi\.service\(['"](api::[^'"]+)['"]\)\.(\w+)/g;
     let match;
 
     while ((match = serviceCallRegex.exec(lineText)) !== null) {
-      const startPos = match.index;
-      const endPos = match.index + match[0].length;
       const serviceName = match[1];
       const methodName = match[2];
 
-      // Check if cursor is within this match
-      // We want to match if cursor is on the method name
       const methodStartPos = match.index + match[0].indexOf('.' + methodName) + 1;
       const methodEndPos = methodStartPos + methodName.length;
 
@@ -89,6 +98,47 @@ class StrapiServiceDefinitionProvider {
     }
 
     return null;
+  }
+
+  /**
+   * Match chained service call where service is stored in a variable
+   * @param {vscode.TextDocument} document
+   * @param {vscode.Position} position
+   */
+  matchChainedServiceCall(document, position) {
+    const wordRange = document.getWordRangeAtPosition(position, /[\w$]+/);
+    if (!wordRange) {
+      return null;
+    }
+
+    const methodName = document.getText(wordRange);
+    const lineText = document.lineAt(position.line).text;
+    const methodStartCharacter = wordRange.start.character;
+    const textBeforeMethod = lineText.slice(0, methodStartCharacter);
+    const dotIndex = textBeforeMethod.lastIndexOf('.');
+
+    if (dotIndex === -1) {
+      return null;
+    }
+
+    let variablePart = textBeforeMethod.slice(0, dotIndex).trimEnd();
+    if (variablePart.endsWith('?')) {
+      variablePart = variablePart.slice(0, -1).trimEnd();
+    }
+    const variableMatch = variablePart.match(/([A-Za-z_$][\w$]*)\s*$/);
+
+    if (!variableMatch) {
+      return null;
+    }
+
+    const variableName = variableMatch[1];
+    const serviceName = this.findServiceNameForVariable(document, position.line, variableName);
+
+    if (!serviceName) {
+      return null;
+    }
+
+    return { serviceName, methodName };
   }
 
   /**
@@ -144,16 +194,16 @@ class StrapiServiceDefinitionProvider {
       // Also support: methodName: function(...) { or 'methodName': function(...) {
       const escapedMethodName = methodName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const methodPatterns = [
-        // Pattern: async methodName( or methodName( - most common in Strapi
-        new RegExp(`\\s*(async\\s+)?${escapedMethodName}\\s*\\(`),
+        // Pattern: async methodName( or methodName(
+        new RegExp(`^\\s*(async\\s+)?${escapedMethodName}\\s*\\(`),
         // Pattern: methodName: function( or methodName: async function(
-        new RegExp(`${escapedMethodName}\\s*:\\s*(async\\s+)?function\\s*\\(`),
+        new RegExp(`^\\s*${escapedMethodName}\\s*:\\s*(async\\s+)?function\\s*\\(`),
         // Pattern: 'methodName': function( or "methodName": function(
-        new RegExp(`['"]${escapedMethodName}['"]\\s*:\\s*(async\\s+)?function\\s*\\(`),
+        new RegExp(`^\\s*['"]${escapedMethodName}['"]\\s*:\\s*(async\\s+)?function\\s*\\(`),
         // Pattern: methodName: async (...) => or methodName: (...) =>
-        new RegExp(`${escapedMethodName}\\s*:\\s*(async\\s+)?\\([^)]*\\)\\s*=>`),
+        new RegExp(`^\\s*${escapedMethodName}\\s*:\\s*(async\\s+)?\\([^)]*\\)\\s*=>`),
         // Pattern: 'methodName': async (...) => or "methodName": (...) =>
-        new RegExp(`['"]${escapedMethodName}['"]\\s*:\\s*(async\\s+)?\\([^)]*\\)\\s*=>`)
+        new RegExp(`^\\s*['"]${escapedMethodName}['"]\\s*:\\s*(async\\s+)?\\([^)]*\\)\\s*=>`)
       ];
 
       for (let i = 0; i < lines.length; i++) {
@@ -162,7 +212,7 @@ class StrapiServiceDefinitionProvider {
           const match = line.match(pattern);
           if (match) {
             // Find the position of methodName in the line
-            const methodIndex = line.indexOf(methodName);
+              const methodIndex = line.indexOf(methodName, match.index ?? 0);
             if (methodIndex !== -1) {
               const uri = vscode.Uri.file(filePath);
               const position = new vscode.Position(i, methodIndex);
@@ -181,6 +231,33 @@ class StrapiServiceDefinitionProvider {
       vscode.window.showErrorMessage(`Error reading service file: ${error.message}`);
       return null;
     }
+  }
+
+  /**
+   * Find the service name assigned to a variable
+   * @param {vscode.TextDocument} document
+   * @param {number} startLine
+   * @param {string} variableName
+   * @returns {string|null}
+   */
+  findServiceNameForVariable(document, startLine, variableName) {
+    const assignmentPatterns = [
+      new RegExp(`(?:const|let|var)\\s+${variableName}\\s*=\\s*strapi\\.service\\(['"](api::[^'"]+)['"]\\)`),
+      new RegExp(`${variableName}\\s*=\\s*strapi\\.service\\(['"](api::[^'"]+)['"]\\)`)
+    ];
+
+    for (let lineNumber = startLine; lineNumber >= 0; lineNumber--) {
+      const lineText = document.lineAt(lineNumber).text;
+
+      for (const pattern of assignmentPatterns) {
+        const match = lineText.match(pattern);
+        if (match) {
+          return match[1];
+        }
+      }
+    }
+
+    return null;
   }
 }
 
