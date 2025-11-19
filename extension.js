@@ -150,12 +150,14 @@ class StrapiServiceDefinitionProvider {
   resolveServiceFilePath(document, serviceName) {
     // Parse service name: "api::user-profile.user-profile"
     // Extract content type: "user-profile"
-    const match = serviceName.match(/^api::([^.]+)\./);
-    if (!match) {
+    const [namespacePrefix, rest] = serviceName.split('::');
+    if (namespacePrefix !== 'api' || !rest) {
       return null;
     }
 
-    const contentType = match[1];
+    const parts = rest.split('.');
+    const contentType = parts[0];
+    const serviceFileName = parts.slice(1).join('.') || contentType;
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
     if (!workspaceFolder) {
       return null;
@@ -166,16 +168,25 @@ class StrapiServiceDefinitionProvider {
     const srcPath = config.get('srcPath', 'src');
 
     // Build service file path: src/api/{content-type}/services/{content-type}.js
-    const serviceFilePath = path.join(
+    const serviceBasePath = path.join(
       workspaceFolder.uri.fsPath,
       srcPath,
       'api',
       contentType,
       'services',
-      `${contentType}.js`
+      serviceFileName
     );
 
-    return serviceFilePath;
+    const extensions = ['.js', '.ts', '.jsx', '.tsx'];
+    for (const ext of extensions) {
+      const candidatePath = `${serviceBasePath}${ext}`;
+      if (fs.existsSync(candidatePath)) {
+        return candidatePath;
+      }
+    }
+
+    // Fall back to .js even if it does not exist yet, so caller can show warning
+    return `${serviceBasePath}.js`;
   }
 
   /**
