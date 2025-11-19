@@ -2,6 +2,8 @@ const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 
+const SUPPORTED_SCRIPT_EXTENSIONS = ['.js', '.ts', '.jsx', '.tsx'];
+
 /**
  * Activates the extension
  * @param {vscode.ExtensionContext} context
@@ -33,26 +35,45 @@ class StrapiServiceDefinitionProvider {
   provideDefinition(document, position, token) {
     // Check if cursor is on a service method call
     const serviceCallMatch = this.findServiceCallAtPosition(document, position);
-    if (!serviceCallMatch) {
-      return null;
+    if (serviceCallMatch) {
+      const { serviceName, methodName } = serviceCallMatch;
+      const serviceFilePath = this.resolveServiceFilePath(document, serviceName);
+      if (!serviceFilePath) {
+        return null;
+      }
+
+      if (!fs.existsSync(serviceFilePath)) {
+        vscode.window.showWarningMessage(`Service file not found: ${serviceFilePath}`);
+        return null;
+      }
+
+      return this.findMethodDefinition(serviceFilePath, methodName);
     }
 
-    const { serviceName, methodName } = serviceCallMatch;
+    // Check if cursor is on a controller handler reference (e.g., handler: 'recommendation.getFeedV2')
+    const controllerHandlerMatch = this.findControllerHandlerAtPosition(document, position);
+    if (controllerHandlerMatch) {
+      const { namespace, apiName, controllerName, actionName } = controllerHandlerMatch;
+      const controllerFilePath = this.resolveControllerFilePath(
+        document,
+        namespace,
+        apiName,
+        controllerName
+      );
 
-    // Resolve service file path
-    const serviceFilePath = this.resolveServiceFilePath(document, serviceName);
-    if (!serviceFilePath) {
-      return null;
+      if (!controllerFilePath) {
+        return null;
+      }
+
+      if (!fs.existsSync(controllerFilePath)) {
+        vscode.window.showWarningMessage(`Controller file not found: ${controllerFilePath}`);
+        return null;
+      }
+
+      return this.findMethodDefinition(controllerFilePath, actionName);
     }
 
-    // Check if file exists
-    if (!fs.existsSync(serviceFilePath)) {
-      vscode.window.showWarningMessage(`Service file not found: ${serviceFilePath}`);
-      return null;
-    }
-
-    // Find method definition in service file
-    return this.findMethodDefinition(serviceFilePath, methodName);
+    return null;
   }
 
   /**
@@ -142,6 +163,115 @@ class StrapiServiceDefinitionProvider {
   }
 
   /**
+   * Detect handler string (e.g., handler: 'recommendation.getFeedV2') at cursor position
+   * @param {vscode.TextDocument} document
+   * @param {vscode.Position} position
+   * @returns {{namespace: string, apiName: string, controllerName: string, actionName: string}|null}
+   */
+  findControllerHandlerAtPosition(document, position) {
+    const lineText = document.lineAt(position.line).text;
+    const handlerRegex = /(?:['"])?handler(?:['"])?\s*:\s*['"]([^'"]+)['"]/g;
+    let match;
+
+    while ((match = handlerRegex.exec(lineText)) !== null) {
+      const handlerValue = match[1];
+      const handlerStart = lineText.indexOf(handlerValue, match.index);
+      if (handlerStart === -1) {
+        continue;
+      }
+
+      const handlerEnd = handlerStart + handlerValue.length;
+      if (position.character >= handlerStart && position.character <= handlerEnd) {
+        return this.parseHandlerString(handlerValue, document);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Parse handler string into namespace, api, controller, and action identifiers
+   * @param {string} handlerValue
+   */
+  parseHandlerString(handlerValue, document) {
+    if (!handlerValue) {
+      return null;
+    }
+
+    let namespace = 'api';
+    let rest = handlerValue;
+    const inferredApiName = this.inferApiNameFromDocument(document);
+
+    const namespaceSeparatorIndex = handlerValue.indexOf('::');
+    if (namespaceSeparatorIndex !== -1) {
+      namespace = handlerValue.slice(0, namespaceSeparatorIndex);
+      rest = handlerValue.slice(namespaceSeparatorIndex + 2);
+    }
+
+    const segments = rest.split('.').filter(Boolean);
+    if (segments.length === 0) {
+      return null;
+    }
+
+    const actionName = segments.pop();
+    const controllerName = segments.pop() || null;
+    let apiName = null;
+
+    if (!controllerName) {
+      return null;
+    }
+
+    if (namespace === 'api' || namespace === 'plugin') {
+      if (handlerValue.includes('::')) {
+        apiName = segments.shift() || controllerName;
+      }
+
+      if (!apiName) {
+        apiName = inferredApiName || controllerName;
+      }
+    } else {
+      return null;
+    }
+
+    return {
+      namespace,
+      apiName,
+      controllerName,
+      actionName
+    };
+  }
+
+  /**
+   * Infer api name from the current document's path (e.g., src/api/<apiName>/routes/*.js)
+   * @param {vscode.TextDocument} document
+   * @returns {string|null}
+   */
+  inferApiNameFromDocument(document) {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    if (!workspaceFolder) {
+      return null;
+    }
+
+    const config = vscode.workspace.getConfiguration('strapiServiceNavigation');
+    const srcPath = config.get('srcPath', 'src');
+    const srcAbsolutePath = path.join(workspaceFolder.uri.fsPath, srcPath);
+    const documentPath = document.uri.fsPath;
+
+    if (!documentPath.startsWith(srcAbsolutePath)) {
+      return null;
+    }
+
+    const relativeToSrc = path.relative(srcAbsolutePath, documentPath);
+    const segments = relativeToSrc.split(path.sep);
+
+    if (segments.length < 3 || segments[0] !== 'api') {
+      return null;
+    }
+
+    return segments[1] || null;
+  }
+
+  /**
    * Resolve service file path from service name
    * @param {vscode.TextDocument} document
    * @param {string} serviceName - e.g., "api::user-profile.user-profile"
@@ -177,16 +307,113 @@ class StrapiServiceDefinitionProvider {
       serviceFileName
     );
 
-    const extensions = ['.js', '.ts', '.jsx', '.tsx'];
-    for (const ext of extensions) {
-      const candidatePath = `${serviceBasePath}${ext}`;
+    return this.resolveFileWithExtensions(serviceBasePath);
+  }
+
+  /**
+   * Resolve controller file path from handler info
+   * @param {vscode.TextDocument} document
+   * @param {'api'|'plugin'} namespace
+   * @param {string} apiName
+   * @param {string} controllerName
+   * @returns {string|null}
+   */
+  resolveControllerFilePath(document, namespace, apiName, controllerName) {
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+    if (!workspaceFolder) {
+      return null;
+    }
+
+    const config = vscode.workspace.getConfiguration('strapiServiceNavigation');
+    const srcPath = config.get('srcPath', 'src');
+
+    let controllerBasePath;
+    if (namespace === 'api') {
+      controllerBasePath = path.join(
+        workspaceFolder.uri.fsPath,
+        srcPath,
+        'api',
+        apiName,
+        'controllers',
+        controllerName
+      );
+    } else if (namespace === 'plugin') {
+      controllerBasePath = path.join(
+        workspaceFolder.uri.fsPath,
+        srcPath,
+        'plugins',
+        apiName,
+        'controllers',
+        controllerName
+      );
+    } else {
+      return null;
+    }
+
+    const controllerPath = this.findExistingFileWithExtensions(controllerBasePath);
+    if (controllerPath) {
+      return controllerPath;
+    }
+
+    let servicesBasePath;
+    if (namespace === 'api') {
+      servicesBasePath = path.join(
+        workspaceFolder.uri.fsPath,
+        srcPath,
+        'api',
+        apiName,
+        'services',
+        controllerName
+      );
+    } else if (namespace === 'plugin') {
+      servicesBasePath = path.join(
+        workspaceFolder.uri.fsPath,
+        srcPath,
+        'plugins',
+        apiName,
+        'services',
+        controllerName
+      );
+    }
+
+    if (servicesBasePath) {
+      const servicePath = this.findExistingFileWithExtensions(servicesBasePath);
+      if (servicePath) {
+        return servicePath;
+      }
+    }
+
+    return `${controllerBasePath}.js`;
+  }
+
+  /**
+   * Try to find a file by appending supported extensions. If none exist, fall back to .js.
+   * @param {string} fileBasePath
+   * @returns {string}
+   */
+  resolveFileWithExtensions(fileBasePath) {
+    const existingPath = this.findExistingFileWithExtensions(fileBasePath);
+    if (existingPath) {
+      return existingPath;
+    }
+
+    return `${fileBasePath}.js`;
+  }
+
+  /**
+   * Find a file by appending supported extensions. Returns null if nothing exists.
+   * @param {string} fileBasePath
+   * @returns {string|null}
+   */
+  findExistingFileWithExtensions(fileBasePath) {
+    for (const ext of SUPPORTED_SCRIPT_EXTENSIONS) {
+      const candidatePath = `${fileBasePath}${ext}`;
       if (fs.existsSync(candidatePath)) {
         return candidatePath;
       }
     }
 
-    // Fall back to .js even if it does not exist yet, so caller can show warning
-    return `${serviceBasePath}.js`;
+    return null;
   }
 
   /**
